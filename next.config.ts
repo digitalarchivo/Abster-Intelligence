@@ -16,23 +16,35 @@ import type {NextConfig} from 'next';
 //   error) rather than a CSP violation that looks like a bug.
 // - connect-src includes 'https:' as a fallback because the LLM provider
 //   list includes Azure OpenAI endpoints with arbitrary subdomains.
-//   We narrow this in v1.2 by collecting actual user-configured endpoints.
+//   Tightening this to an explicit host list would break user-configured
+//   providers; revisit when provider endpoints are curated.
+//
+// CSP tightening notes:
+// - 'unsafe-eval' is only emitted in DEVELOPMENT builds (HMR needs it).
+//   Production React/Next runtime code does not use eval, so the directive
+//   is dropped — removing a whole class of XSS execution primitives.
+// - img-src no longer allows plain http: images (mixed content risk);
+//   https:, data: and blob: cover every legitimate image source.
+// - frame-src 'none' added (complements frame-ancestors 'none').
+const isDev = process.env.NODE_ENV !== 'production';
 const cspDirectives = [
   "default-src 'self'",
-  "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+  `script-src 'self' 'unsafe-inline'${isDev ? " 'unsafe-eval'" : ''}`,
   // 'unsafe-inline' is required because Next.js App Router inlines some
-  // bootstrap scripts. 'unsafe-eval' is required for dev mode (HMR).
-  // In production we could tighten this with nonces — deferred to v1.2.
+  // bootstrap scripts. Nonce-based CSP requires middleware plumbing and is
+  // deferred to v1.2.
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
   "font-src 'self' https://fonts.gstatic.com data:",
-  "img-src 'self' data: blob: https: http:",
+  "img-src 'self' data: blob: https:",
   // Allow any https image (LLM responses sometimes embed remote images;
   // vault files are blob: URLs; placeholder images come from various CDNs).
   "connect-src 'self' https: http://localhost:* ws://localhost:* wss://localhost:*",
   // LLM providers + OSINT APIs all use https. localhost variants are for
   // Ollama and user-run MCP servers.
   "frame-ancestors 'none'",
-  // Clickjacking protection — Abster must never be embedded in an iframe.
+  "frame-src 'none'",
+  // Clickjacking protection — Abster must never be embedded in an iframe,
+  // and must not embed third-party frames itself.
   "form-action 'self'",
   "base-uri 'self'",
   "object-src 'none'",
