@@ -1,8 +1,29 @@
 import { sanitizeMarkdown } from './security';
 
+/**
+ * Render budget: the markdown pipeline runs ~15 regex passes plus DOMPurify
+ * over the FULL text on every call, and the streaming UI re-renders on each
+ * chunk. Above this budget the cost becomes quadratic and a hostile share
+ * link (or a runaway LLM stream) can freeze the main thread for seconds.
+ * The limit only affects DISPLAY — the full message text is always preserved
+ * in IndexedDB.
+ */
+const MAX_RENDER_LENGTH = 200_000; // 200 KB ≈ 40k tokens of visible text
+
+const TRUNCATION_NOTICE =
+  '<div style="margin:8px 0;padding:8px 10px;border:1px dashed #333;border-radius:6px;color:#888;font-size:10px;letter-spacing:0.05em">⚠ CONTENT TOO LARGE TO RENDER — DISPLAY TRUNCATED · FULL TEXT PRESERVED IN DATABASE</div>';
+
 export const renderMarkdown = (text: string) => {
   if (!text) return "";
-  let html = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  let source = text;
+  let truncated = false;
+  if (source.length > MAX_RENDER_LENGTH) {
+    // Cut at a line boundary when possible to avoid mid-HTML fragmentation.
+    const cut = source.lastIndexOf("\n", MAX_RENDER_LENGTH);
+    source = cut > MAX_RENDER_LENGTH * 0.5 ? source.slice(0, cut) : source.slice(0, MAX_RENDER_LENGTH);
+    truncated = true;
+  }
+  let html = source.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
   // Handle <think> / </think> blocks
   html = html.replace(/&lt;think&gt;([\s\S]*?)&lt;\/think&gt;/gi, (_, thought) => {
@@ -37,5 +58,6 @@ export const renderMarkdown = (text: string) => {
     .replace(/\n\n/g, '<div style="height:8px"></div>')
     .replace(/\n/g, "<br/>");
     
-  return sanitizeMarkdown(parsed);
+  const clean = sanitizeMarkdown(parsed);
+  return truncated ? clean + TRUNCATION_NOTICE : clean;
 };
