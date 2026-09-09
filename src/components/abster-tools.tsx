@@ -422,7 +422,7 @@ export default function AbsterTools({ onClose }: { onClose?: () => void }) {
                             </span>
                           ))}
                           <div className="flex gap-2 ml-auto">
-                            <button className="text-[10px] font-bold text-white/40 hover:text-white transition-colors" onClick={() => window.open(t.url, '_blank')}>
+                            <button className="text-[10px] font-bold text-white/40 hover:text-white transition-colors" onClick={() => window.open(t.url, '_blank', 'noopener,noreferrer')}>
                               LAUNCH ↗
                             </button>
                           </div>
