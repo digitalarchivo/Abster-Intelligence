@@ -1,10 +1,32 @@
 import { NextResponse } from 'next/server';
 
+// `limit` is a raw query string: `limit=abc` used to produce NaN (an empty
+// response) and `limit=-1`/`limit=1e9` returned nearly the whole dataset.
+// Validate and clamp the sampling percentage explicitly.
+const DEFAULT_LIMIT = 25;
+const MAX_LIMIT = 100;
+
+function parseLimit(raw: string | null): { ok: true; value: number } | { ok: false; error: string } {
+  if (raw === null || raw.trim() === '') return { ok: true, value: DEFAULT_LIMIT };
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+    return { ok: false, error: `Invalid 'limit' parameter: expected an integer, got '${raw}'` };
+  }
+  if (parsed < 0 || parsed > MAX_LIMIT) {
+    return { ok: false, error: `Invalid 'limit' parameter: expected 0-${MAX_LIMIT}, got ${parsed}` };
+  }
+  return { ok: true, value: parsed };
+}
+
 export async function GET(request: Request) {
   try {
     const url = new URL(request.url);
     const limitParam = url.searchParams.get('limit');
-    const limit = limitParam ? parseInt(limitParam, 10) : 25; // Default to 25%
+    const parsedLimit = parseLimit(limitParam);
+    if (parsedLimit.ok !== true) {
+      return NextResponse.json({ error: parsedLimit.error }, { status: 400 });
+    }
+    const limit = parsedLimit.value; // percentage of the feed to sample
 
     const response = await fetch('https://data-cloud.flightradar24.com/zones/fcgi/feed.js?bounds=80,-80,-180,180&faa=1&mlat=1&flarm=1&adsb=1&gnd=0&air=1&vehicles=0&estimated=1&maxage=14400&gliders=0&stats=0', {
       headers: {
@@ -46,7 +68,7 @@ export async function GET(request: Request) {
     }
 
     // Return a sample based on the requested percentage
-    const sampleSize = Math.floor(flights.length * (limit / 100));
+    const sampleSize = Math.max(0, Math.floor(flights.length * (limit / 100)));
     return NextResponse.json({ ac: flights.slice(0, sampleSize) });
   } catch (error) {
     console.error('Error fetching flights:', error);
