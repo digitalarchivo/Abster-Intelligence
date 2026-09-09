@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { db, LOCAL_USER, type Attachment, type AIProvider } from '../lib/db';
 import { generateId } from '../lib/utils';
+import { backupDataSchema, BACKUP_LIMITS } from '../lib/validation';
 
 // Track object URLs created for vault-file blobs so we can revoke them on
 // removal / factory reset / re-load. Without this, long sessions with many
@@ -227,7 +228,10 @@ export const useAbsterStore = create<AbsterState>((set, get) => ({
     const now = new Date().toISOString();
     const newEntity = { 
       ...entity, 
-      caseId: state.activeCaseId, 
+      // Respect an explicitly provided caseId (entity extraction targets the
+      // case under investigation, which may differ from the active case when
+      // several views are open). Fall back to the active case.
+      caseId: entity.caseId || state.activeCaseId, 
       ownerId: user.uid,
       createdAt: now,
       updatedAt: now
@@ -300,7 +304,8 @@ export const useAbsterStore = create<AbsterState>((set, get) => ({
     const now = new Date().toISOString();
     const newRelation = { 
       ...relation, 
-      caseId: state.activeCaseId, 
+      // See addEntity: honor an explicit caseId, default to the active case.
+      caseId: relation.caseId || state.activeCaseId, 
       ownerId: user.uid,
       createdAt: now,
       updatedAt: now
@@ -547,16 +552,30 @@ export const useAbsterStore = create<AbsterState>((set, get) => ({
 
   exportData: async () => {
     try {
+      const [entities, relations, cases, chats, messages, notes, vaultFiles] = await Promise.all([
+        db.entities.toArray(),
+        db.relations.toArray(),
+        db.cases.toArray(),
+        db.chats.toArray(),
+        db.messages.toArray(),
+        db.notes.toArray(),
+        db.vaultFiles.toArray(),
+      ]);
       const data = {
-        entities: await db.entities.toArray(),
-        relations: await db.relations.toArray(),
-        cases: await db.cases.toArray(),
-        chats: await db.chats.toArray(),
-        messages: await db.messages.toArray(),
-        notes: await db.notes.toArray(),
-        settings: await db.settings.toArray(),
+        v: 1,
+        exportedAt: new Date().toISOString(),
+        entities,
+        relations,
+        cases,
+        chats,
+        messages,
+        notes,
+        // NOTE: settings are intentionally NOT exported. The settings row
+        // contains LLM API keys, OSINT API keys, MCP auth tokens and provider
+        // endpoints — a backup file that leaves the device must never carry
+        // credentials. Configuration is per-device by design.
         // Cannot easily export blobs in a simple JSON string predictably, skip vault files blobs or just meta
-        vaultFiles: (await db.vaultFiles.toArray()).map(f => ({ ...f, data: null, url: null }))
+        vaultFiles: vaultFiles.map(f => ({ ...f, data: null, url: null }))
       };
       return JSON.stringify(data);
     } catch (error) {
@@ -567,25 +586,51 @@ export const useAbsterStore = create<AbsterState>((set, get) => ({
 
   importData: async (dataStr: string) => {
     try {
-      const data = JSON.parse(dataStr);
-      await db.transaction('rw', [db.entities, db.relations, db.cases, db.chats, db.messages, db.notes, db.settings, db.vaultFiles], async () => {
+      // A backup file is untrusted input: it may come from anywhere. The
+      // zod schema normalizes enums, repairs invalid dates, strips unknown
+      // fields, and caps collection sizes. Crucially, the schema has no
+      // `settings` member — a crafted backup can never inject a foreign
+      // provider `baseUrl` / API key into this device (a silent
+      // conversation-exfiltration vector).
+      if (typeof dataStr !== 'string' || dataStr.length === 0) {
+        throw new Error('Backup file is empty.');
+      }
+      if (dataStr.length > BACKUP_LIMITS.MAX_RAW_LENGTH) {
+        throw new Error(`Backup file too large (${Math.round(dataStr.length / 1048576)} MB > ${Math.round(BACKUP_LIMITS.MAX_RAW_LENGTH / 1048576)} MB limit).`);
+      }
+      let raw: unknown;
+      try {
+        raw = JSON.parse(dataStr);
+      } catch {
+        throw new Error('Backup file is not valid JSON.');
+      }
+      const parsed = backupDataSchema.safeParse(raw);
+      if (!parsed.success) {
+        const issue = parsed.error.issues?.[0];
+        throw new Error(`Backup file failed validation${issue ? `: ${issue.path?.join('.') || 'root'} — ${issue.message}` : ''}.`);
+      }
+      const data = parsed.data;
+
+      // `settings` is deliberately neither cleared nor imported: the user's
+      // providers, keys, MCP servers and active chat stay untouched so a
+      // restore never breaks the local AI configuration (and a hostile file
+      // can never reconfigure it).
+      await db.transaction('rw', [db.entities, db.relations, db.cases, db.chats, db.messages, db.notes, db.vaultFiles], async () => {
         await db.entities.clear();
         await db.relations.clear();
         await db.cases.clear();
         await db.chats.clear();
         await db.messages.clear();
         await db.notes.clear();
-        await db.settings.clear();
         await db.vaultFiles.clear();
 
-        if (data.entities) await db.entities.bulkAdd(data.entities);
-        if (data.relations) await db.relations.bulkAdd(data.relations);
-        if (data.cases) await db.cases.bulkAdd(data.cases);
-        if (data.chats) await db.chats.bulkAdd(data.chats);
-        if (data.messages) await db.messages.bulkAdd(data.messages);
-        if (data.notes) await db.notes.bulkAdd(data.notes);
-        if (data.settings) await db.settings.bulkAdd(data.settings);
-        if (data.vaultFiles) await db.vaultFiles.bulkAdd(data.vaultFiles);
+        if (data.entities.length) await db.entities.bulkAdd(data.entities as any);
+        if (data.relations.length) await db.relations.bulkAdd(data.relations as any);
+        if (data.cases.length) await db.cases.bulkAdd(data.cases as any);
+        if (data.chats.length) await db.chats.bulkAdd(data.chats as any);
+        if (data.messages.length) await db.messages.bulkAdd(data.messages as any);
+        if (data.notes.length) await db.notes.bulkAdd(data.notes as any);
+        if (data.vaultFiles.length) await db.vaultFiles.bulkAdd(data.vaultFiles as any);
       });
       // reload UI
       await get().loadInitialData();

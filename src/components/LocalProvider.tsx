@@ -153,6 +153,21 @@ export default function LocalProvider({ children }: { children: React.ReactNode 
           }
         }
       }
+      // A shared case with no chats used to be imported with activeChatId=null:
+      // the case existed in the DB but the chat panel stayed empty and the
+      // investigation looked "orphaned". Create a starter chat so the shared
+      // case is immediately usable.
+      if (newChats.length === 0) {
+        newChats.push({
+          id: `c-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+          title: `${payload.case.title || 'Shared case'} (shared copy)`,
+          caseId: newCaseId,
+          ownerId: LOCAL_USER.uid,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          metadata: { totalMessages: 0, fileCount: 0 },
+        });
+      }
 
       await db.transaction('rw', [db.cases, db.entities, db.relations, db.chats, db.messages, db.settings], async () => {
         await db.cases.add(newCase as any);

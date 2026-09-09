@@ -20,6 +20,7 @@
 
 import LZString from "lz-string";
 import type { Case, Entity, Relation, Chat, ChatMessage } from "../store/absterStore";
+import { shareableCasePayloadSchema, SHARE_LIMITS, type ValidatedSharePayload } from "./validation";
 
 export interface ShareableCasePayload {
   v: 1; // schema version for forward compatibility
@@ -70,13 +71,21 @@ export function encodeCaseForSharing(
 }
 
 /**
- * Decompress + deserialize a case payload from a URL hash.
- * Returns null if the input is malformed or the schema version is unsupported.
+ * Decompress + deserialize + VALIDATE a case payload from a URL hash.
+ * Returns null if the input is malformed, oversized, or fails schema
+ * validation. Every field is normalized (enums lowercased, invalid dates
+ * repaired, unknown fields stripped) so a crafted link can never crash the
+ * receiver's Dashboard.
  */
-export function decodeCaseFromSharing(compressed: string): ShareableCasePayload | null {
+export function decodeCaseFromSharing(compressed: string): ValidatedSharePayload | null {
   try {
     if (!compressed || compressed.length < 10) {
       console.warn("decodeCaseFromSharing: empty or too-short input");
+      return null;
+    }
+    // Guard 1: compressed input must fit a sane URL budget.
+    if (compressed.length > SHARE_LIMITS.MAX_COMPRESSED_LENGTH) {
+      console.warn("decodeCaseFromSharing: compressed payload exceeds limit", { inputLen: compressed.length });
       return null;
     }
     const json = LZString.decompressFromEncodedURIComponent(compressed);
@@ -84,22 +93,26 @@ export function decodeCaseFromSharing(compressed: string): ShareableCasePayload 
       console.warn("decodeCaseFromSharing: LZString.decompress returned null", { inputLen: compressed.length, inputHead: compressed.slice(0, 50) });
       return null;
     }
-    let payload: ShareableCasePayload;
+    // Guard 2: reject oversized decompressed payloads before JSON.parse /
+    // DB write — a ~13 KB link can decompress to 20+ MB.
+    if (json.length > SHARE_LIMITS.MAX_DECOMPRESSED_LENGTH) {
+      console.warn("decodeCaseFromSharing: decompressed payload exceeds limit", { jsonLen: json.length });
+      return null;
+    }
+    let raw: unknown;
     try {
-      payload = JSON.parse(json) as ShareableCasePayload;
+      raw = JSON.parse(json);
     } catch (parseErr) {
       console.warn("decodeCaseFromSharing: JSON.parse failed", parseErr, { jsonHead: json.slice(0, 200) });
       return null;
     }
-    if (!payload || payload.v !== 1) {
-      console.warn("Unknown shareable case schema version", payload?.v);
+    // Schema validation + normalization + per-collection size caps.
+    const parsed = shareableCasePayloadSchema.safeParse(raw);
+    if (!parsed.success) {
+      console.warn("decodeCaseFromSharing: schema validation failed", parsed.error.issues?.slice(0, 5));
       return null;
     }
-    if (!payload.case || !Array.isArray(payload.entities) || !Array.isArray(payload.relations)) {
-      console.warn("decodeCaseFromSharing: missing required fields", { hasCase: !!payload.case, entitiesIsArray: Array.isArray(payload.entities), relationsIsArray: Array.isArray(payload.relations) });
-      return null;
-    }
-    return payload;
+    return parsed.data;
   } catch (err) {
     console.error("decodeCaseFromSharing failed", err);
     return null;
