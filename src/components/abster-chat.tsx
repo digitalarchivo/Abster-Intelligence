@@ -129,7 +129,8 @@ const createAdapter = (provider: AIProvider) => {
     onChunk: (chunk: string) => void, 
     onDone: () => void, 
     onError: (err: string) => void, 
-    contextData = ""
+    contextData = "",
+    signal?: AbortSignal,
   ) => {
     const userMessages = messages.map(m => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content }));
     // For OpenAI-compatible providers we prepend the extraction system prompt as the first
@@ -156,12 +157,16 @@ const createAdapter = (provider: AIProvider) => {
         const responseStream = await ai.models.generateContentStream({
           model: modelId,
           contents: contents,
-          config: { systemInstruction }
+          // Pass the AbortSignal to the SDK so the STOP button also
+          // cancels the underlying HTTP request (client-side).
+          config: { systemInstruction, ...(signal ? { abortSignal: signal } : {}) }
         });
 
         for await (const chunk of responseStream) {
+          if (signal?.aborted) break; // STOP button: bail out early
           if (chunk.text) onChunk(chunk.text);
         }
+        if (signal?.aborted) return; // stopStream() finalizes the partial message
         onDone();
         return;
       }
@@ -195,7 +200,7 @@ const createAdapter = (provider: AIProvider) => {
         const isO1 = model.startsWith("o1");
         body = JSON.stringify({ model, messages: messagesWithSystem, ...(isO1 ? {} : { stream: true }) });
         if (isO1) {
-          const resp2 = await fetch(url, { method: "POST", headers, body });
+          const resp2 = await fetch(url, { method: "POST", headers, body, signal });
           if (!resp2.ok) { const err = await resp2.text(); onError(`Error ${resp2.status}: ${err.slice(0,200)}`); return; }
           const data = await resp2.json();
           const content = data.choices?.[0]?.message?.content || "";
@@ -216,7 +221,7 @@ const createAdapter = (provider: AIProvider) => {
         headers = { "Content-Type": "application/json", Authorization: `Bearer ${key}` };
         body = JSON.stringify({ model: provider.selectedModel || "command-r-plus", messages: messagesWithSystem, stream: true });
       }
-      const resp = await fetch(url, { method: "POST", headers, body });
+      const resp = await fetch(url, { method: "POST", headers, body, signal });
       if (!resp.ok) { const err = await resp.text(); onError(`Error ${resp.status}: ${err.slice(0,200)}`); return; }
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
@@ -224,6 +229,7 @@ const createAdapter = (provider: AIProvider) => {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        if (signal?.aborted) { reader.cancel().catch(() => {}); break; }
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
@@ -243,8 +249,14 @@ const createAdapter = (provider: AIProvider) => {
           } catch {}
         }
       }
+      if (signal?.aborted) return; // stopped by user — stopStream() writes the partial
       onDone();
-    } catch (err) { onError(err.message || "Connection error"); }
+    } catch (err) {
+      // An abort from the STOP button is not an error: the partial message
+      // is finalized by stopStream() itself.
+      if (signal?.aborted || (err as any)?.name === "AbortError") return;
+      onError(err.message || "Connection error");
+    }
   };
   const testConnection = async () => {
     try {
@@ -421,6 +433,10 @@ export default function AbsterChat() {
   const [advancedAddModal, setAdvancedAddModal] = useState(null);
 
   const stopStreamRef = useRef(false);
+  // Active AbortController for the in-flight LLM request. The STOP button
+  // previously only ignored incoming chunks; the network request, its API
+  // cost and its memory kept running in the background.
+  const abortRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -460,18 +476,31 @@ export default function AbsterChat() {
     }
   }, [mounted, activeChatId, chats]);
 
-  // Save to Dexie on change
+  // Save to Dexie on change.
+  // The previous implementation `put` the whole settings row with
+  // `apiKeys: {}`, wiping the user's HIBP/Shodan keys and MCP servers on
+  // every provider/chat change. We now merge: read-modify-write preserving
+  // every field this component does not own (apiKeys, mcpServers, ...).
   useEffect(() => {
     if (mounted && currentUser) {
-      import('../lib/db').then(({ db }) => {
-        db.settings.put({
-          id: 'current_user_settings',
+      import('../lib/db').then(async ({ db }) => {
+        const id = 'current_user_settings';
+        const changes = {
           providers,
           selectedProviderId,
           selectedModelId,
           activeChatId,
-          apiKeys: {} // Keep existing keys if any, though we might need to merge
-        }).catch(e => console.error("Error saving to local DB", e));
+        };
+        try {
+          const existing = await db.settings.get(id);
+          if (existing) {
+            await db.settings.update(id, changes); // shallow merge into the row
+          } else {
+            await db.settings.put({ id, ...changes, apiKeys: {} });
+          }
+        } catch (e) {
+          console.error("Error saving to local DB", e);
+        }
       });
     }
   }, [providers, selectedProviderId, selectedModelId, activeChatId, mounted, currentUser]);
@@ -499,6 +528,16 @@ export default function AbsterChat() {
     return () => window.removeEventListener("click", close);
   }, []);
 
+  // Every message append must be computed from the LATEST store state,
+  // never from a stale render-time snapshot. Concurrent writers (slash
+  // commands, entity extraction, streaming responses) used to overwrite
+  // each other's messages because `updateChat` replaces the whole message
+  // list (delete + bulkAdd).
+  const appendMessagesToChat = useCallback((chatId: string, msgs: any[], extra: Record<string, any> = {}) => {
+    const current = useAbsterStore.getState().chats.find(c => c.id === chatId)?.messages || [];
+    updateChat(chatId, { messages: [...current, ...msgs], ...extra });
+  }, [updateChat]);
+
   const sendMessage = useCallback(async () => {
     if (!inputValue.trim() && pendingAttachments.length === 0) return;
     if (isStreaming) return;
@@ -508,12 +547,15 @@ export default function AbsterChat() {
     // the graph even before configuring an API key.
     const trimmed = inputValue.trim();
     if (trimmed.startsWith("/")) {
+      // Hold the streaming lock for the whole command execution: async OSINT
+      // lookups used to race against a second user message and silently
+      // delete it from the store.
+      setIsStreaming(true);
       const userMsg = {
         id: generateId(), role: "user", content: inputValue, timestamp: new Date().getTime(),
         attachments: [], provider: null,
       };
-      const updatedMessages = [...(activeChat?.messages || []), userMsg];
-      updateChat(activeChatId!, { messages: updatedMessages });
+      appendMessagesToChat(activeChatId!, [userMsg]);
       setInputValue("");
       setPendingAttachments([]);
       setStreamError(null);
@@ -611,8 +653,7 @@ export default function AbsterChat() {
             // Show an interim "querying" message so the user gets immediate feedback.
             const interimId = generateId();
             const interimMsg = { id: interimId, role: "assistant", content: "_Querying Shodan..._", timestamp: new Date().getTime(), attachments: [], provider: "slash", modelId: null };
-            const messagesWithInterim = [...updatedMessages, interimMsg];
-            updateChat(activeChatId!, { messages: messagesWithInterim });
+            appendMessagesToChat(activeChatId!, [interimMsg]);
             const result = await shodanLookup(ip, shodanKey);
             const state = useAbsterStore.getState();
             const fresh = state.entities.filter(e => e.caseId === caseId);
@@ -627,7 +668,7 @@ export default function AbsterChat() {
             const finalText = `${result.summary}\n\n_Added ${merge.addedEntities} entities and ${merge.addedRelations} relations to the graph._`;
             const finalMsg = { id: generateId(), role: "assistant", content: finalText, timestamp: new Date().getTime(), attachments: [], provider: "slash", modelId: null };
             // We need to read the LATEST messages (the store may have evolved), filter interim, append final.
-            const latest = useAbsterStore.getState().chats.find(c => c.id === activeChatId)?.messages || messagesWithInterim;
+            const latest = useAbsterStore.getState().chats.find(c => c.id === activeChatId)?.messages || [];
             const filtered = latest.filter(m => m.id !== interimId);
             updateChat(activeChatId!, { messages: [...filtered, finalMsg] });
             return;
@@ -639,8 +680,7 @@ export default function AbsterChat() {
           } else {
             const interimId = generateId();
             const interimMsg = { id: interimId, role: "assistant", content: "_Querying RDAP/WHOIS..._", timestamp: new Date().getTime(), attachments: [], provider: "slash", modelId: null };
-            const messagesWithInterim = [...updatedMessages, interimMsg];
-            updateChat(activeChatId!, { messages: messagesWithInterim });
+            appendMessagesToChat(activeChatId!, [interimMsg]);
             const result = await whoisLookup(domain);
             const state = useAbsterStore.getState();
             const fresh = state.entities.filter(e => e.caseId === caseId);
@@ -653,7 +693,7 @@ export default function AbsterChat() {
             });
             const finalText = `${result.summary}\n\n_Added ${merge.addedEntities} entities and ${merge.addedRelations} relations to the graph._`;
             const finalMsg = { id: generateId(), role: "assistant", content: finalText, timestamp: new Date().getTime(), attachments: [], provider: "slash", modelId: null };
-            const latest = useAbsterStore.getState().chats.find(c => c.id === activeChatId)?.messages || messagesWithInterim;
+            const latest = useAbsterStore.getState().chats.find(c => c.id === activeChatId)?.messages || [];
             const filtered = latest.filter(m => m.id !== interimId);
             updateChat(activeChatId!, { messages: [...filtered, finalMsg] });
             return;
@@ -667,8 +707,7 @@ export default function AbsterChat() {
           } else {
             const interimId = generateId();
             const interimMsg = { id: interimId, role: "assistant", content: `_Querying DNS ${recordType} records..._`, timestamp: new Date().getTime(), attachments: [], provider: "slash", modelId: null };
-            const messagesWithInterim = [...updatedMessages, interimMsg];
-            updateChat(activeChatId!, { messages: messagesWithInterim });
+            appendMessagesToChat(activeChatId!, [interimMsg]);
             const result = await dnsLookup(domain, recordType);
             const state = useAbsterStore.getState();
             const fresh = state.entities.filter(e => e.caseId === caseId);
@@ -681,7 +720,7 @@ export default function AbsterChat() {
             });
             const finalText = `${result.summary}\n\n_Added ${merge.addedEntities} entities and ${merge.addedRelations} relations to the graph._`;
             const finalMsg = { id: generateId(), role: "assistant", content: finalText, timestamp: new Date().getTime(), attachments: [], provider: "slash", modelId: null };
-            const latest = useAbsterStore.getState().chats.find(c => c.id === activeChatId)?.messages || messagesWithInterim;
+            const latest = useAbsterStore.getState().chats.find(c => c.id === activeChatId)?.messages || [];
             const filtered = latest.filter(m => m.id !== interimId);
             updateChat(activeChatId!, { messages: [...filtered, finalMsg] });
             return;
@@ -693,8 +732,7 @@ export default function AbsterChat() {
           } else {
             const interimId = generateId();
             const interimMsg = { id: interimId, role: "assistant", content: "_Querying Wayback Machine..._", timestamp: new Date().getTime(), attachments: [], provider: "slash", modelId: null };
-            const messagesWithInterim = [...updatedMessages, interimMsg];
-            updateChat(activeChatId!, { messages: messagesWithInterim });
+            appendMessagesToChat(activeChatId!, [interimMsg]);
             const result = await waybackLookup(url);
             const state = useAbsterStore.getState();
             const fresh = state.entities.filter(e => e.caseId === caseId);
@@ -707,7 +745,7 @@ export default function AbsterChat() {
             });
             const finalText = `${result.summary}\n\n_Added ${merge.addedEntities} entities and ${merge.addedRelations} relations to the graph._`;
             const finalMsg = { id: generateId(), role: "assistant", content: finalText, timestamp: new Date().getTime(), attachments: [], provider: "slash", modelId: null };
-            const latest = useAbsterStore.getState().chats.find(c => c.id === activeChatId)?.messages || messagesWithInterim;
+            const latest = useAbsterStore.getState().chats.find(c => c.id === activeChatId)?.messages || [];
             const filtered = latest.filter(m => m.id !== interimId);
             updateChat(activeChatId!, { messages: [...filtered, finalMsg] });
             return;
@@ -753,7 +791,7 @@ export default function AbsterChat() {
               let args: Record<string, any> = {};
               if (argsJson) {
                 try { args = JSON.parse(argsJson); }
-                catch { reply = `Invalid JSON args: \`${argsJson}\``; const assistantMsg2 = { id: generateId(), role: "assistant", content: reply, timestamp: new Date().getTime(), attachments: [], provider: "slash", modelId: null }; updateChat(activeChatId!, { messages: [...updatedMessages, assistantMsg2] }); return; }
+                catch { reply = `Invalid JSON args: \`${argsJson}\``; const assistantMsg2 = { id: generateId(), role: "assistant", content: reply, timestamp: new Date().getTime(), attachments: [], provider: "slash", modelId: null }; appendMessagesToChat(activeChatId!, [assistantMsg2]); return; }
               }
               try {
                 const result = await callTool(srv, toolName, args);
@@ -771,13 +809,16 @@ export default function AbsterChat() {
         }
       } catch (err: any) {
         reply = `Command failed: ${err?.message || "unknown error"}`;
+      } finally {
+        // Release the streaming lock held for the slash command.
+        setIsStreaming(false);
       }
 
       const assistantMsg = {
         id: generateId(), role: "assistant", content: reply, timestamp: new Date().getTime(),
         attachments: [], provider: "slash", modelId: null,
       };
-      updateChat(activeChatId!, { messages: [...updatedMessages, assistantMsg] });
+      appendMessagesToChat(activeChatId!, [assistantMsg]);
       return;
     }
 
@@ -811,7 +852,7 @@ export default function AbsterChat() {
       });
     }
     const updatedMessages = [...(activeChat?.messages || []), userMsg];
-    updateChat(activeChatId!, { messages: updatedMessages });
+    appendMessagesToChat(activeChatId!, [userMsg]);
 
     setInputValue("");
     setPendingAttachments([]);
@@ -824,26 +865,56 @@ export default function AbsterChat() {
       const adapter = createAdapter(providerWithModel);
       let fullText = "";
 
+      // Real network cancellation for the STOP button.
+      const controller = new AbortController();
+      abortRef.current = controller;
+
       const { entities, relations } = useAbsterStore.getState();
       const caseEntities = entities.filter(e => e.caseId === activeChat?.caseId);
       const caseRelations = relations.filter(r => r.caseId === activeChat?.caseId);
       const contextData = `Entities: ${JSON.stringify(caseEntities.map(e => ({ name: e.name, type: e.type, notes: e.notes })))}\nRelationships: ${JSON.stringify(caseRelations.map(r => ({ source: r.source, target: r.target, type: r.label })))}`;
 
+      // A hostile or runaway stream can emit megabytes. Re-rendering
+      // markdown on EVERY chunk makes the total cost quadratic and can
+      // freeze the tab / exhaust memory. We (1) cap the accumulated text at
+      // 1 MB and (2) throttle UI re-renders to ~16 fps — the final message is
+      // still persisted in full (up to the cap).
+      const MAX_STREAM_CHARS = 1024 * 1024;
+      let streamTruncated = false;
+      let lastRenderAt = 0;
+
       await adapter.streamText(
         updatedMessages.filter((m) => m.role !== "system"),
-        (chunk) => { if (stopStreamRef.current) return; fullText += chunk; setStreamingText(fullText); },
+        (chunk) => {
+          if (stopStreamRef.current) return;
+          if (fullText.length < MAX_STREAM_CHARS) {
+            fullText += chunk;
+            if (fullText.length >= MAX_STREAM_CHARS) {
+              streamTruncated = true;
+              fullText = fullText.slice(0, MAX_STREAM_CHARS);
+            }
+          }
+          const now = Date.now();
+          if (now - lastRenderAt >= 60) {
+            lastRenderAt = now;
+            setStreamingText(fullText);
+          }
+        },
         async () => {
           setIsStreaming(false);
+          abortRef.current = null;
 
           // Parse out the trailing ```abster-entities block and merge into the graph.
-          let textForMessage = fullText;
+          let textForMessage = streamTruncated
+            ? `${fullText}\n\n_[RESPONSE TRUNCATED AT 1 MB SAFETY LIMIT]_`
+            : fullText;
           try {
             const extraction = extractGraphFromResponse(fullText);
             if (extraction.malformed) {
               console.warn("[entity-extraction] LLM emitted a malformed abster-entities block");
             }
             if (extraction.graph && extraction.graph.entities.length > 0) {
-              textForMessage = extraction.cleanedText;
+              textForMessage = extraction.cleanedText + (streamTruncated ? "\n\n_[RESPONSE TRUNCATED AT 1 MB SAFETY LIMIT]_" : "");
               const store = useAbsterStore.getState();
               const fresh = store.entities.filter(e => e.caseId === activeChat?.caseId);
               await mergeGraphIntoActiveCase(extraction.graph, {
@@ -859,14 +930,16 @@ export default function AbsterChat() {
           }
 
           const msg = { id: generateId(), role: "assistant", content: textForMessage, timestamp: new Date().getTime(), attachments: [], provider: selectedProviderId, modelId: selectedModelId };
-          updateChat(activeChatId!, {
-            messages: [...updatedMessages, msg],
-            metadata: { ...activeChat?.metadata, totalMessages: (activeChat?.metadata?.totalMessages || 0) + 2 }
+          // Latest-read append: never rebuild the message list from the
+          // pre-request snapshot.
+          appendMessagesToChat(activeChatId!, [msg], {
+            metadata: { ...activeChat?.metadata, totalMessages: (activeChat?.metadata?.totalMessages || 0) + 2 },
           });
           setStreamingText("");
         },
-        (err) => { setIsStreaming(false); setStreamError(err); setStreamingText(""); },
-        contextData
+        (err) => { setIsStreaming(false); abortRef.current = null; setStreamError(err); setStreamingText(""); },
+        contextData,
+        controller.signal
       );
     } else {
       // No provider configured — surface an honest hint instead of fake demo responses.
@@ -878,18 +951,23 @@ export default function AbsterChat() {
         else {
           clearInterval(interval); setIsStreaming(false);
           const msg = { id: generateId(), role: "assistant", content: text, timestamp: new Date().getTime(), attachments: [], provider: "hint", modelId: null };
-          updateChat(activeChatId!, { messages: [...updatedMessages, msg] });
+          appendMessagesToChat(activeChatId!, [msg]);
           setStreamingText("");
         }
       }, 6);
     }
-  }, [inputValue, pendingAttachments, isStreaming, activeChatId, activeChat, selectedProvider, selectedModelId, selectedProviderId, addVaultFile, updateChat, currentUser?.uid]);
+  }, [inputValue, pendingAttachments, isStreaming, activeChatId, activeChat, selectedProvider, selectedModelId, selectedProviderId, addVaultFile, updateChat, appendMessagesToChat, currentUser?.uid]);
 
   const stopStream = () => {
-    stopStreamRef.current = true; setIsStreaming(false);
+    stopStreamRef.current = true;
+    // Cancel the in-flight request — network, API cost and memory stop
+    // immediately instead of continuing invisibly.
+    try { abortRef.current?.abort(); } catch {}
+    abortRef.current = null;
+    setIsStreaming(false);
     if (streamingText) {
       const msg = { id: generateId(), role: "assistant", content: streamingText, timestamp: new Date().getTime(), attachments: [], provider: selectedProviderId };
-      updateChat(activeChatId!, { messages: [...(activeChat?.messages || []), msg] });
+      appendMessagesToChat(activeChatId!, [msg]);
     }
     setStreamingText("");
   };
@@ -1393,7 +1471,50 @@ function SettingsModal({ providers, onClose, onAdd, onUpdate, onRemove, onTest }
   const [editingId, setEditingId] = useState(null);
   const [editKey, setEditKey] = useState("");
   const [confirmPurge, setConfirmPurge] = useState(false);
+  // OSINT tool keys: the /hibp and /shodan commands read settings.apiKeys,
+  // but no UI ever persisted them — the advertised feature ("Add a Shodan
+  // API key in Settings") was impossible to fulfill.
+  const [osintHibpKey, setOsintHibpKey] = useState("");
+  const [osintShodanKey, setOsintShodanKey] = useState("");
+  const [osintKeysSaved, setOsintKeysSaved] = useState(false);
   const { exportData, importData, factoryReset } = useAbsterStore();
+
+  // Load existing OSINT keys once when the modal opens.
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        const { db } = await import("../lib/db");
+        const settings = await db.settings.get("current_user_settings");
+        if (mounted) {
+          setOsintHibpKey(settings?.apiKeys?.hibp || "");
+          setOsintShodanKey(settings?.apiKeys?.shodan || "");
+        }
+      } catch (e) {
+        console.error("Error loading OSINT keys", e);
+      }
+    })();
+    return () => { mounted = false; };
+  }, []);
+
+  const saveOsintKeys = async () => {
+    try {
+      const { db } = await import("../lib/db");
+      const id = "current_user_settings";
+      const existing: any = (await db.settings.get(id)) || { id, providers: [], selectedProviderId: null, selectedModelId: null, activeChatId: null, apiKeys: {} };
+      const apiKeys = { ...(existing.apiKeys || {}) };
+      const hibp = osintHibpKey.trim();
+      const shodan = osintShodanKey.trim();
+      if (hibp) apiKeys.hibp = hibp; else delete apiKeys.hibp;
+      if (shodan) apiKeys.shodan = shodan; else delete apiKeys.shodan;
+      await db.settings.put({ ...existing, apiKeys }); // preserve providers & mcpServers
+      setOsintKeysSaved(true);
+      setTimeout(() => setOsintKeysSaved(false), 2000);
+    } catch (e) {
+      console.error("Error saving OSINT keys", e);
+      alert("Failed to save OSINT keys.");
+    }
+  };
 
   const handleExport = async () => {
     try {
@@ -1468,7 +1589,7 @@ function SettingsModal({ providers, onClose, onAdd, onUpdate, onRemove, onTest }
           <div style={{ display: "flex", gap: 10, marginBottom: 24, background: "#111", padding: "12px", borderRadius: 8, border: "1px solid #1a1a1a" }}>
              <div style={{ flex: 1 }}>
                <div style={{ fontSize: 11, fontWeight: 600, color: "#fff", marginBottom: 4 }}>Global Backup & Restore</div>
-               <div style={{ fontSize: 9, color: "#666", marginBottom: 12 }}>Export or import your entire investigation database to prevent data loss.</div>
+               <div style={{ fontSize: 9, color: "#666", marginBottom: 12 }}>Export or import your entire investigation database to prevent data loss. Provider configuration and API keys never leave this device.</div>
                <div style={{ display: "flex", gap: 8 }}>
                  <button onClick={handleExport} style={{ ...btnSec, flex: 1, justifyContent: "center" }}>Export Backup</button>
                  <label style={{ ...btnSec, flex: 1, justifyContent: "center", cursor: "pointer" }}>
@@ -1486,6 +1607,28 @@ function SettingsModal({ providers, onClose, onAdd, onUpdate, onRemove, onTest }
                <div style={{ fontSize: 11, fontWeight: 600, color: "#EF4444", marginBottom: 4 }}>Factory Reset</div>
                <div style={{ fontSize: 9, color: "#EF4444", opacity: 0.8, marginBottom: 12 }}>Wipe all local data, demo investigations, and settings. This action is irreversible.</div>
                <button onClick={() => setConfirmPurge(true)} style={{ background: "#EF4444", color: "#fff", border: "none", borderRadius: 6, padding: "6px 12px", fontSize: 10, fontWeight: 600, cursor: "pointer", width: "100%" }}>Execute Total Purge</button>
+             </div>
+          </div>
+
+          <div style={{ fontSize: 10, color: "#444", letterSpacing: "0.1em", marginBottom: 12 }}>OSINT TOOL KEYS</div>
+          
+          <div style={{ display: "flex", gap: 10, marginBottom: 24, background: "#111", padding: "12px", borderRadius: 8, border: "1px solid #1a1a1a" }}>
+             <div style={{ flex: 1 }}>
+               <div style={{ fontSize: 11, fontWeight: 600, color: "#fff", marginBottom: 4 }}>HaveIBeenPwned & Shodan</div>
+               <div style={{ fontSize: 9, color: "#666", marginBottom: 10 }}>Keys for the <code style={{ color: "#34d399", fontSize: 9 }}>/hibp</code> and <code style={{ color: "#34d399", fontSize: 9 }}>/shodan</code> slash commands. Stored locally only. Leave empty to keep demo mode.</div>
+               <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                 <div style={{ flex: 1 }}>
+                   <div style={{ fontSize: 9, color: "#555", marginBottom: 3 }}>HIBP API KEY</div>
+                   <input type="password" value={osintHibpKey} onChange={(e) => setOsintHibpKey(e.target.value)} placeholder="(demo mode)" autoComplete="off" spellCheck={false}
+                     style={{ width: "100%", background: "#0a0a0a", border: "1px solid #1a1a1a", borderRadius: 6, color: "#e0e0e0", fontSize: 10, padding: "6px 8px", fontFamily: "inherit", boxSizing: "border-box" }} />
+                 </div>
+                 <div style={{ flex: 1 }}>
+                   <div style={{ fontSize: 9, color: "#555", marginBottom: 3 }}>SHODAN API KEY</div>
+                   <input type="password" value={osintShodanKey} onChange={(e) => setOsintShodanKey(e.target.value)} placeholder="(demo mode)" autoComplete="off" spellCheck={false}
+                     style={{ width: "100%", background: "#0a0a0a", border: "1px solid #1a1a1a", borderRadius: 6, color: "#e0e0e0", fontSize: 10, padding: "6px 8px", fontFamily: "inherit", boxSizing: "border-box" }} />
+                 </div>
+               </div>
+               <button onClick={saveOsintKeys} style={{ ...btnSec, width: "100%", justifyContent: "center" }}>{osintKeysSaved ? "✓ SAVED" : "Save OSINT Keys"}</button>
              </div>
           </div>
 
