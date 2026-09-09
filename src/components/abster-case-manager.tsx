@@ -177,6 +177,13 @@ const SC = { active:  {label:"ACTIVE",  color:"#10B981",bg:"rgba(16,185,129,0.1)
              closed:  {label:"CLOSED",  color:"#4B5563",bg:"rgba(75,85,99,0.15)",  border:"rgba(75,85,99,0.4)"} };
 const CC = { public:{label:"PUBLIC",color:"#3B82F6"}, confidential:{label:"CONFIDENTIAL",color:"#8B5CF6"},
              secret:{label:"SECRET",color:"#DC2626"}, top_secret:{label:"TOP SECRET",color:"#7F1D1D"} };
+// Defense in depth: cases can reach the UI with enum values the
+// lookup tables don't contain (legacy DBs, imported data). Direct `PC[p]`
+// access returned `undefined` and crashed the whole case manager. These safe
+// accessors normalize and fall back instead of exploding.
+const PC_KEY = (p) => { const k = String(p||"").trim().toLowerCase(); return PC[k] ? k : "medium"; };
+const SC_KEY = (s) => { const k = String(s||"").trim().toLowerCase(); return SC[k] ? k : "active"; };
+const CC_KEY = (c) => { const k = String(c||"").trim().toLowerCase().replace(/\s+/g,"_"); return CC[k] ? k : "confidential"; };
 const HYPO_S = { active:{label:"ACTIVE",color:"#CA8A04"}, confirmed:{label:"CONFIRMED",color:"#10B981"}, discarded:{label:"DISCARDED",color:"#4B5563"} };
 const ACT_ICONS = { created:"◈",updated:"✎",entity_added:"⬡",location_added:"◉",event_added:"◷",tool_executed:"⚙",note_added:"✦",status_changed:"⬕",hypothesis_added:"◆",link_added:"⇔",checklist_updated:"☑" };
 
@@ -361,8 +368,8 @@ const CaseModal = ({init,tpl,allCases,onSave,onClose}: any) => {
               <div style={{display:"flex",flexDirection:"column",gap:3,maxHeight:130,overflowY:"auto"}}>
                 {allCases.map(c=>(
                   <label key={c.id} style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",padding:"6px 10px",borderRadius:4,background:f.linkedCases.includes(c.id)?"#1A1A1A":"transparent",border:`1px solid ${f.linkedCases.includes(c.id)?"#2A2A2A":"transparent"}`}}>
-                    <input type="checkbox" checked={f.linkedCases.includes(c.id)} onChange={()=>toggleLink(c.id)} style={{accentColor:PC[c.priority].color}}/>
-                    <span style={{fontFamily:"'Courier New',monospace",fontSize:10,color:PC[c.priority].color}}>{c.codeName}</span>
+                    <input type="checkbox" checked={f.linkedCases.includes(c.id)} onChange={()=>toggleLink(c.id)} style={{accentColor:PC[PC_KEY(c.priority)].color}}/>
+                    <span style={{fontFamily:"'Courier New',monospace",fontSize:10,color:PC[PC_KEY(c.priority)].color}}>{c.codeName}</span>
                     <span style={{fontSize:11,color:"#A0A0A0",flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.title}</span>
                   </label>
                 ))}
@@ -384,7 +391,7 @@ const CaseModal = ({init,tpl,allCases,onSave,onClose}: any) => {
 // ════════════════════════════════════════════════════════════════
 const Preview = ({c,all,onOpen,onClose}: any) => {
   if(!c)return null;
-  const p=PC[c.priority],s=SC[c.status],cl=CC[c.classification];
+  const p=PC[PC_KEY(c.priority)],s=SC[SC_KEY(c.status)],cl=CC[CC_KEY(c.classification)];
   const score=calcRisk(c,all);
   const linked=all.filter(x=>x.id!==c.id&&(c.linkedCases||[]).includes(x.id));
   const tpl=TEMPLATES.find(t=>t.id===c.template);
@@ -433,8 +440,8 @@ const Preview = ({c,all,onOpen,onClose}: any) => {
               <SLabel>LINKED CASES</SLabel>
               {linked.map(lc=>(
                 <div key={lc.id} style={{display:"flex",gap:8,padding:"6px 0",borderBottom:"1px solid #111"}}>
-                  <span style={{color:PC[lc.priority].color,fontSize:10}}>⇔</span>
-                  <div><div style={{fontSize:10,color:PC[lc.priority].color,fontFamily:"'Courier New',monospace"}}>{lc.codeName}</div><div style={{fontSize:11,color:"#A0A0A0"}}>{lc.title}</div></div>
+                  <span style={{color:PC[PC_KEY(lc.priority)].color,fontSize:10}}>⇔</span>
+                  <div><div style={{fontSize:10,color:PC[PC_KEY(lc.priority)].color,fontFamily:"'Courier New',monospace"}}>{lc.codeName}</div><div style={{fontSize:11,color:"#A0A0A0"}}>{lc.title}</div></div>
                 </div>
               ))}
             </div>
@@ -466,7 +473,7 @@ const Preview = ({c,all,onOpen,onClose}: any) => {
 // ════════════════════════════════════════════════════════════════
 const Card = ({c,all,sel,bulk,onToggle,onPreview,onOpen,onEdit,onDup,onArchive,onClose,onReopen,onDel, mounted}: any) => {
   const [menu,setMenu]=useState(false);
-  const p=PC[c.priority],s=SC[c.status],cl=CC[c.classification];
+  const p=PC[PC_KEY(c.priority)],s=SC[SC_KEY(c.status)],cl=CC[CC_KEY(c.classification)];
   const score=calcRisk(c,all), tpl=TEMPLATES.find(t=>t.id===c.template);
   const chkDone=(c.checklist||[]).filter(Boolean).length, chkTotal=(c.checklist||[]).length;
   const linkedN=(c.linkedCases||[]).length;
@@ -528,7 +535,7 @@ const Detail = ({c,all,onBack,onEdit,onUpdate}: any) => {
   const [findings,setFindings]=useState(c.findings||"");
   const [newH,setNewH]=useState({title:"",confidence:50,evidence:""});
   const [showNewH,setShowNewH]=useState(false);
-  const p=PC[c.priority],s=SC[c.status],cl=CC[c.classification];
+  const p=PC[PC_KEY(c.priority)],s=SC[SC_KEY(c.status)],cl=CC[CC_KEY(c.classification)];
   const score=calcRisk(c,all), rl=riskMeta(score);
   const tpl=TEMPLATES.find(t=>t.id===c.template);
   const linked=all.filter(x=>x.id!==c.id&&(c.linkedCases||[]).includes(x.id));
@@ -813,7 +820,7 @@ export default function AbsterDashboard({ onClose }: { onClose?: () => void }) {
               </div>
             ) : (
               <div>
-                {filtered.map(c=>{const p=PC[c.priority],s=SC[c.status],score=calcRisk(c,cases),rl=riskMeta(score);return(
+                {filtered.map(c=>{const p=PC[PC_KEY(c.priority)],s=SC[SC_KEY(c.status)],score=calcRisk(c,cases),rl=riskMeta(score);return(
                   <div key={c.id} style={{display:"flex",alignItems:"center",gap:14,padding:"10px 14px",borderLeft:`2px solid ${p.color}`,marginBottom:2,background:sel.has(c.id)?"#141414":"#0A0A0A",borderRadius:3,cursor:"pointer",transition:"background 0.1s"}}
                     onClick={()=>bulk?togSel(c.id):setPreview(c)}>
                     {bulk&&<input type="checkbox" checked={sel.has(c.id)} onChange={()=>togSel(c.id)} style={{accentColor:p.color}}/>}

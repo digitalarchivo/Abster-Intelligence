@@ -901,7 +901,11 @@ export default function AbsterTimeline({ onClose }: { onClose?: () => void }) {
       });
 
     const all = [...entityEvents, ...relationEvents];
-    return all;
+    // Impossible dates: a garbage startDate (e.g. "not-a-date" from a legacy
+    // DB or a crafted share link) produced Invalid Date objects whose NaN
+    // timestamps silently corrupted the timeline sort, scale and layout.
+    // Drop events with unparseable dates — the data stays in the DB untouched.
+    return all.filter(ev => ev.date instanceof Date && Number.isFinite(ev.date.getTime()));
   }, [entities, relations]);
 
   const allEvents = useMemo(() => {

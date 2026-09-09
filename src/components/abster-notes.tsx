@@ -78,7 +78,7 @@ export default function AbsterNotes({ onClose }: { onClose?: () => void }) {
         description: "Auto-generated case for field notes.",
         status: "active",
         priority: "medium",
-        classification: "CONFIDENTIAL",
+        classification: "confidential",
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         leadInvestigator: user.displayName || "OPERATIVE",
